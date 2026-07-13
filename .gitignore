@@ -1,0 +1,25 @@
+# Virtual environment — machine specific, recreated via requirements.txt
+venv/
+
+# Environment variables — contains secrets (Redis URL, DB passwords, API keys)
+.env
+
+# Python cache files — auto-generated, not real code
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# pytest cache
+.pytest_cache/
+
+# VS Code settings — editor specific, not project specific
+.vscode/
+
+# Distribution/packaging
+dist/
+build/
+*.egg-info/
+
+# Locust results (optional — add if you don't want test results committed)
+locust_results/git
