@@ -59,30 +59,40 @@ def log_job(job: Job, status: str):
 
 
 def run_worker():
+    import redis
     print("Worker started, waiting for jobs...")
     while True:
-        job_data = r.blpop(QUEUE_KEY, timeout=0)
-        if job_data:
-            job_json = job_data[1]
-            job = Job.model_validate_json(job_json)
+        try:
+            # Use a non-zero timeout to periodically cycle the socket and prevent idle drops
+            job_data = r.blpop(QUEUE_KEY, timeout=5)
+            if job_data:
+                job_json = job_data[1]
+                job = Job.model_validate_json(job_json)
 
-            try:
-                process_job(job.model_dump())
-                log_job(job, "completed")
+                try:
+                    process_job(job.model_dump())
+                    log_job(job, "completed")
 
-            except Exception as e:
-                print(f"❌ Job failed: {e}")
-                job.retry_count += 1
+                except Exception as e:
+                    print(f"❌ Job failed: {e}")
+                    job.retry_count += 1
 
-                if job.retry_count < MAX_RETRIES:
-                    print(f"🔄 Retrying job {job.job_id} (attempt {job.retry_count + 1} of {MAX_RETRIES})")
-                    log_job(job, "retrying")
-                    r.rpush(QUEUE_KEY, job.model_dump_json())
-                else:
-                    print(f"💀 Job {job.job_id} exceeded max retries — moving to dead-letter queue")
-                    job.status = "failed"
-                    log_job(job, "failed")
-                    r.rpush(DEAD_LETTER_KEY, job.model_dump_json())
+                    if job.retry_count < MAX_RETRIES:
+                        print(f"🔄 Retrying job {job.job_id} (attempt {job.retry_count + 1} of {MAX_RETRIES})")
+                        log_job(job, "retrying")
+                        r.rpush(QUEUE_KEY, job.model_dump_json())
+                    else:
+                        print(f"💀 Job {job.job_id} exceeded max retries — moving to dead-letter queue")
+                        job.status = "failed"
+                        log_job(job, "failed")
+                        r.rpush(DEAD_LETTER_KEY, job.model_dump_json())
+        except (redis.exceptions.TimeoutError, TimeoutError):
+            # Normal timeout when no new items arrive within the 5s window, continue loop safely
+            continue
+        except redis.exceptions.RedisError as re:
+            print(f"⚠️ Redis communication issue: {re}, retrying in 2 seconds...")
+            import time
+            time.sleep(2)
 
 
 if __name__ == "__main__":
