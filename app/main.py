@@ -1,11 +1,16 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from app.rate_limiter.limiter import is_allowed 
 from app.db.database import SessionLocal
 from app.db.models import JobRecord
 from app.redis_client import r
 
 app=FastAPI()
+
+class CustomJobRequest(BaseModel):
+    task_type: str
+    payload: dict
 
 @app.get("/check/rate_limit/{user_id}")
 def check_rate_limit(user_id: str):
@@ -40,6 +45,27 @@ def get_metrics():
     finally:
         db.close()
 
+@app.get("/api/jobs")
+def get_recent_jobs():
+    db = SessionLocal()
+    try:
+        jobs = db.query(JobRecord).order_by(JobRecord.updated_at.desc()).limit(10).all()
+        return [
+            {
+                "job_id": job.job_id,
+                "task_type": job.task_type,
+                "status": job.status,
+                "retry_count": job.retry_count,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+            for job in jobs
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
 @app.post("/api/submit_test_job")
 def submit_test_job():
     try:
@@ -49,6 +75,15 @@ def submit_test_job():
         task_type = random.choice(task_types)
         job_id = submit_job(task_type, {"random_payload": random.randint(100, 999)})
         return {"status": "success", "job_id": job_id, "task_type": task_type}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/submit_custom_job")
+def submit_custom_job(request: CustomJobRequest):
+    try:
+        from app.job_queue.producer import submit_job
+        job_id = submit_job(request.task_type, request.payload)
+        return {"status": "success", "job_id": job_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -170,13 +205,14 @@ def serve_dashboard():
                 grid-template-columns: 1fr 2fr;
                 gap: 2rem;
                 align-items: start;
+                margin-bottom: 2rem;
             }
             @media (max-width: 900px) {
                 .dashboard-body {
                     grid-template-columns: 1fr;
                 }
             }
-            .control-panel, .chart-panel {
+            .control-panel, .chart-panel, .jobs-panel {
                 background-color: var(--bg-secondary);
                 border: 1px solid #334155;
                 border-radius: 1rem;
@@ -194,38 +230,83 @@ def serve_dashboard():
                 background: linear-gradient(135deg, #38bdf8, #0284c7);
                 color: var(--text-main);
                 border: none;
-                padding: 1rem;
-                font-size: 1rem;
+                padding: 0.75rem;
+                font-size: 0.95rem;
                 font-weight: 600;
-                border-radius: 0.75rem;
+                border-radius: 0.5rem;
                 cursor: pointer;
                 transition: opacity 0.2s ease, transform 0.1s ease;
                 margin-bottom: 1rem;
             }
-            .btn:hover {
-                opacity: 0.9;
+            .btn:hover { opacity: 0.9; }
+            .btn:active { transform: scale(0.98); }
+            
+            .input-group {
+                margin-bottom: 1rem;
+                text-align: left;
             }
-            .btn:active {
-                transform: scale(0.98);
+            .input-group label {
+                display: block;
+                font-size: 0.85rem;
+                color: var(--text-muted);
+                margin-bottom: 0.4rem;
             }
+            .input-group input, .input-group select {
+                width: 100%;
+                background-color: var(--bg-primary);
+                border: 1px solid #334155;
+                color: var(--text-main);
+                padding: 0.6rem;
+                border-radius: 0.5rem;
+                font-size: 0.9rem;
+            }
+            
             .log-box {
                 background-color: var(--bg-primary);
                 border: 1px solid #334155;
-                border-radius: 0.75rem;
-                padding: 1rem;
-                height: 180px;
+                border-radius: 0.5rem;
+                padding: 0.8rem;
+                height: 120px;
                 overflow-y: auto;
                 font-family: monospace;
-                font-size: 0.85rem;
+                font-size: 0.8rem;
                 color: var(--text-muted);
             }
             .log-entry {
-                margin-bottom: 0.5rem;
+                margin-bottom: 0.4rem;
                 border-bottom: 1px solid #1e293b;
-                padding-bottom: 0.3rem;
+                padding-bottom: 0.2rem;
             }
             .log-entry.success { color: var(--accent-green); }
             .log-entry.info { color: var(--accent-blue); }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 1rem;
+                font-size: 0.9rem;
+                text-align: left;
+            }
+            th, td {
+                padding: 0.75rem;
+                border-bottom: 1px solid #334155;
+            }
+            th {
+                color: var(--text-muted);
+                font-weight: 600;
+                text-transform: uppercase;
+                font-size: 0.8rem;
+            }
+            .badge {
+                padding: 0.25rem 0.5rem;
+                border-radius: 0.25rem;
+                font-size: 0.75rem;
+                font-weight: 600;
+                text-transform: uppercase;
+            }
+            .badge.completed { background: rgba(52, 211, 153, 0.1); color: var(--accent-green); border: 1px solid rgba(52, 211, 153, 0.2); }
+            .badge.failed { background: rgba(248, 113, 113, 0.1); color: var(--accent-red); border: 1px solid rgba(248, 113, 113, 0.2); }
+            .badge.retrying { background: rgba(251, 191, 36, 0.1); color: var(--accent-yellow); border: 1px solid rgba(251, 191, 36, 0.2); }
         </style>
     </head>
     <body>
@@ -266,8 +347,23 @@ def serve_dashboard():
 
             <div class="dashboard-body">
                 <div class="control-panel">
-                    <h2 class="panel-title">Actions & Events</h2>
-                    <button class="btn" onclick="submitTestJob()">Submit Random Job</button>
+                    <h2 class="panel-title">Manual Job Dispatcher</h2>
+                    <div class="input-group">
+                        <label for="task_type">Task Type</label>
+                        <select id="task_type">
+                            <option value="send_email">Email Notification</option>
+                            <option value="process_payment">Process Payment</option>
+                            <option value="generate_pdf">Generate PDF Reports</option>
+                            <option value="sync_data">Data Synchronization</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label for="payload_recipient">Recipient / User ID</label>
+                        <input type="text" id="payload_recipient" placeholder="e.g. user_99" value="user_45">
+                    </div>
+                    <button class="btn" onclick="submitCustomJob()">Dispatch Job</button>
+                    
+                    <h3 style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.5rem; text-align: left;">Live Console</h3>
                     <div class="log-box" id="log-box">
                         <div class="log-entry info">System monitor initialized.</div>
                     </div>
@@ -278,6 +374,29 @@ def serve_dashboard():
                     <div style="position: relative; height: 300px; width: 100%;">
                         <canvas id="metricsChart"></canvas>
                     </div>
+                </div>
+            </div>
+
+            <div class="jobs-panel">
+                <h2 class="panel-title">Recent Database Logs (Last 10 Actions)</h2>
+                <div style="overflow-x: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Job ID</th>
+                                <th>Task Type</th>
+                                <th>Status</th>
+                                <th>Attempts</th>
+                                <th>Created At</th>
+                                <th>Completed At</th>
+                            </tr>
+                        </thead>
+                        <tbody id="jobs-table-body">
+                            <tr>
+                                <td colspan="6" style="text-align: center; color: var(--text-muted);">No jobs processed yet.</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -295,12 +414,22 @@ def serve_dashboard():
                 box.scrollTop = box.scrollHeight;
             }
 
-            async function submitTestJob() {
+            async function submitCustomJob() {
+                const taskType = document.getElementById('task_type').value;
+                const recipient = document.getElementById('payload_recipient').value;
+                
                 try {
-                    const res = await fetch('/api/submit_test_job', { method: 'POST' });
+                    const res = await fetch('/api/submit_custom_job', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            task_type: taskType,
+                            payload: { recipient_id: recipient, timestamp: new Date().toISOString() }
+                        })
+                    });
                     const data = await res.json();
                     if (data.status === 'success') {
-                        addLog(`Submitted ${data.task_type} job (ID: ${data.job_id.substring(0,8)}...)`, 'success');
+                        addLog(`Dispatched custom ${taskType} job (ID: ${data.job_id.substring(0,8)}...)`, 'success');
                         fetchMetrics();
                     }
                 } catch(e) {
@@ -310,6 +439,7 @@ def serve_dashboard():
 
             async function fetchMetrics() {
                 try {
+                    // Fetch summary
                     const res = await fetch('/api/metrics');
                     const data = await res.json();
                     
@@ -319,9 +449,37 @@ def serve_dashboard():
                     document.getElementById('val-retrying').innerText = data.retrying;
 
                     updateChart(data);
+
+                    // Fetch recent jobs table
+                    const resJobs = await fetch('/api/jobs');
+                    const jobs = await resJobs.json();
+                    populateJobsTable(jobs);
                 } catch (e) {
                     console.error('Error fetching metrics:', e);
                 }
+            }
+
+            function populateJobsTable(jobs) {
+                const body = document.getElementById('jobs-table-body');
+                if (jobs.length === 0) {
+                    body.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No jobs processed yet.</td></tr>`;
+                    return;
+                }
+                
+                body.innerHTML = jobs.map(job => {
+                    const formattedCreated = new Date(job.created_at).toLocaleString();
+                    const formattedCompleted = job.completed_at ? new Date(job.completed_at).toLocaleString() : '-';
+                    return `
+                        <tr>
+                            <td style="font-family: monospace; font-size: 0.85rem; color: var(--accent-blue);">${job.job_id}</td>
+                            <td>${job.task_type}</td>
+                            <td><span class="badge ${job.status}">${job.status}</span></td>
+                            <td>${job.retry_count}</td>
+                            <td>${formattedCreated}</td>
+                            <td>${formattedCompleted}</td>
+                        </tr>
+                    `;
+                }).join('');
             }
 
             function updateChart(data) {
