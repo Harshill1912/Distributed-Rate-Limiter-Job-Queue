@@ -1,12 +1,24 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from app.rate_limiter.limiter import is_allowed 
-from app.db.database import SessionLocal
+from app.rate_limiter.limiter import is_allowed
+from app.db.database import SessionLocal, init_db
 from app.db.models import JobRecord
 from app.redis_client import r
+from app.logging_config import setup_logging
+from app.metrics import timed, latency_stats
 
-app=FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+    init_db()               # create tables on startup
+    yield
+
+
+app = FastAPI(title="Distributed Job Queue & Rate Limiter", lifespan=lifespan)
 
 class CustomJobRequest(BaseModel):
     task_type: str
@@ -14,11 +26,11 @@ class CustomJobRequest(BaseModel):
 
 @app.get("/check/rate_limit/{user_id}")
 def check_rate_limit(user_id: str):
-    allowed = is_allowed(user_id)
+    with timed("rate_limit"):
+        allowed = is_allowed(user_id)
     if allowed:
         return {"message": "Request allowed"}
-    else:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+    raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
 
 @app.get("/api/metrics")
 def get_metrics():
@@ -38,7 +50,12 @@ def get_metrics():
             "completed": completed,
             "failed": failed,
             "retrying": retrying,
-            "total_logged": total_logged
+            "total_logged": total_logged,
+            "latency": {
+                "rate_limit": latency_stats("rate_limit"),   # limiter decision latency
+                "job_process": latency_stats("job_process"),  # worker execution time
+                "job_e2e": latency_stats("job_e2e"),          # enqueue -> completion
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -84,6 +101,8 @@ def submit_custom_job(request: CustomJobRequest):
         from app.job_queue.producer import submit_job
         job_id = submit_job(request.task_type, request.payload)
         return {"status": "success", "job_id": job_id}
+    except ValueError as ve:
+        raise HTTPException(status_code=409, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -345,6 +364,29 @@ def serve_dashboard():
                 </div>
             </div>
 
+            <div class="grid">
+                <div class="card">
+                    <div class="card-title">Rate-limit p50</div>
+                    <div class="card-value success" id="val-p50">0</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted);">ms · median decision latency</p>
+                </div>
+                <div class="card">
+                    <div class="card-title">Rate-limit p95</div>
+                    <div class="card-value queue" id="val-p95">0</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted);">ms</p>
+                </div>
+                <div class="card">
+                    <div class="card-title">Rate-limit p99</div>
+                    <div class="card-value retrying" id="val-p99">0</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted);">ms · tail latency</p>
+                </div>
+                <div class="card">
+                    <div class="card-title">Checks Measured</div>
+                    <div class="card-value" id="val-lat-count">0</div>
+                    <p style="font-size: 0.8rem; color: var(--text-muted);">rate-limit calls sampled</p>
+                </div>
+            </div>
+
             <div class="dashboard-body">
                 <div class="control-panel">
                     <h2 class="panel-title">Manual Job Dispatcher</h2>
@@ -424,13 +466,15 @@ def serve_dashboard():
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             task_type: taskType,
-                            payload: { recipient_id: recipient, timestamp: new Date().toISOString() }
+                            payload: { recipient_id: recipient }
                         })
                     });
                     const data = await res.json();
-                    if (data.status === 'success') {
+                    if (res.ok) {
                         addLog(`Dispatched custom ${taskType} job (ID: ${data.job_id.substring(0,8)}...)`, 'success');
                         fetchMetrics();
+                    } else {
+                        addLog(`⚠️ Ignored: ${data.detail}`, 'retrying');
                     }
                 } catch(e) {
                     addLog('Failed to submit job: ' + e.message, 'dlq');
@@ -447,6 +491,12 @@ def serve_dashboard():
                     document.getElementById('val-completed').innerText = data.completed;
                     document.getElementById('val-dlq').innerText = data.dlq_size;
                     document.getElementById('val-retrying').innerText = data.retrying;
+
+                    const lat = (data.latency && data.latency.rate_limit) || {};
+                    document.getElementById('val-p50').innerText = lat.p50_ms ?? 0;
+                    document.getElementById('val-p95').innerText = lat.p95_ms ?? 0;
+                    document.getElementById('val-p99').innerText = lat.p99_ms ?? 0;
+                    document.getElementById('val-lat-count').innerText = lat.count ?? 0;
 
                     updateChart(data);
 

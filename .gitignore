@@ -22,4 +22,7 @@ build/
 *.egg-info/
 
 # Locust results (optional — add if you don't want test results committed)
-locust_results/git
+locust_results/
+
+# Runtime logs
+*.loggit
